@@ -1,0 +1,85 @@
+package com.ford.decisionplatform.kbsservice.encrypt;
+
+import com.fasterxml.jackson.core.JsonPointer;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class JsonPiiProcessor {
+
+    private final EncryptionService encryptionService;
+
+    private final List<PiiPathInfo> piiPathInfos;
+    
+    private record PiiPathInfo(JsonPointer parentPointer, String fieldName) {}
+
+    public JsonPiiProcessor(EncryptionService encryptionService, @Value("${pii-spii-data-path}") String piiSpiiData) {
+        this.encryptionService = encryptionService;
+        this.piiPathInfos = loadPiiPaths(piiSpiiData);
+    }
+
+    private static List<PiiPathInfo> loadPiiPaths(String piiSpiiData) {
+        if (piiSpiiData == null || piiSpiiData.isBlank()) {
+            throw new IllegalArgumentException("PII data paths cannot be null or empty");
+        }
+        try {
+            return piiSpiiData.lines()
+                              .map(String::trim)
+                              .filter(line -> !line.isEmpty())
+                              .map(JsonPointer::compile)
+                              .map(pointer -> {
+                                  JsonPointer parentPointer = pointer.head();
+                                  String fieldName = pointer.last().getMatchingProperty();
+                                  return new PiiPathInfo(parentPointer, fieldName);
+                              })
+                              .collect(Collectors.toUnmodifiableList());
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to load PII paths from provided data", e);
+        }
+    }
+
+    public String processEncryptJson(JsonNode rootNode) {
+        return processJson(rootNode, true);
+    }
+
+    public String processDecryptJson(JsonNode rootNode) {
+        return processJson(rootNode, false);
+    }
+
+    private String processJson(JsonNode rootNode, boolean isEncrypt) {
+        for (PiiPathInfo pathInfo : piiPathInfos) {
+            JsonNode parentNode = rootNode.at(pathInfo.parentPointer);
+            
+            // Early exit if parent node doesn't exist
+            if (parentNode.isMissingNode()) {
+                continue;
+            }
+            
+            if (parentNode.isArray()) {
+                for (JsonNode element : parentNode) {
+                    processNode(element, pathInfo.fieldName, isEncrypt);
+                }
+            } else {
+                processNode(parentNode, pathInfo.fieldName, isEncrypt);
+            }
+        }
+        return rootNode.toString();
+    }
+
+    private void processNode(JsonNode node, String fieldName, boolean isEncrypt) {
+        if (node instanceof ObjectNode objectNode) {
+            JsonNode targetNode = objectNode.get(fieldName);
+            if (targetNode != null && targetNode.isValueNode()) {
+                String processedValue = isEncrypt
+                        ? encryptionService.encrypt(targetNode.asText())
+                        : encryptionService.decrypt(targetNode.asText());
+                objectNode.put(fieldName, processedValue);
+            }
+        }
+    }
+}
+
