@@ -1,0 +1,76 @@
+package com.ford.decisionplatform.kbsservice.utils;
+
+import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.StorageOptions;
+import com.sun.management.HotSpotDiagnosticMXBean;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
+import org.springframework.boot.actuate.endpoint.annotation.WriteOperation;
+import org.springframework.stereotype.Component;
+
+import javax.management.MBeanServer;
+import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
+
+@Slf4j
+@Component
+@Endpoint(id = "customHeapDump") // This defines the endpoint ID, e.g., /actuator/customHeapDump
+public class CustomHeapDumpActuatorEndpoint {
+
+    @Value("${heap.bucket-name}")
+    private String heapBucketName;
+
+    private final Storage storage;
+
+    public CustomHeapDumpActuatorEndpoint() {
+        this.storage = StorageOptions.getDefaultInstance().getService();
+    }
+
+    @WriteOperation
+    public String generateAndUploadHeapDump() {
+        String tempDir = System.getProperty("java.io.tmpdir");
+        java.nio.file.Path heapDumpDir = java.nio.file.Paths.get(tempDir, "heapdumps");
+        try {
+            // Ensure heapdumps directory exists
+            Files.createDirectories(heapDumpDir);
+            if (!Files.isWritable(heapDumpDir)) {
+                return "Heap dump directory is not writable: " + heapDumpDir.toString();
+            }
+            String fileName = "heapdump-" + System.currentTimeMillis() + ".hprof";
+            String localFilePath = heapDumpDir.resolve(fileName).toString();
+            String gcsObjectName = "on-demand-heapdumps/" + fileName;
+
+            // 1. Generate the heap dump
+            MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+            HotSpotDiagnosticMXBean bean = ManagementFactory.newPlatformMXBeanProxy(
+                    server, "com.sun.management:type=HotSpotDiagnostic", HotSpotDiagnosticMXBean.class);
+            bean.dumpHeap(localFilePath, true); // `true` for live objects only
+            log.info("Heap dump generated at: " + localFilePath);
+            log.info("heapBucketName " + heapBucketName);
+
+            // Validate file existence
+            if (!Files.exists(java.nio.file.Paths.get(localFilePath))) {
+                return "Heap dump file was not created: " + localFilePath;
+            }
+
+            // 2. Upload to GCS
+            BlobId blobId = BlobId.of(heapBucketName, gcsObjectName);
+            BlobInfo blobInfo = BlobInfo.newBuilder(blobId).build();
+            storage.createFrom(blobInfo, java.nio.file.Paths.get(localFilePath));
+            log.info("Heap dump uploaded to GCS: gs://" + heapBucketName + "/" + gcsObjectName);
+
+            // 3. Clean up local file (important for temp usage)
+            Files.deleteIfExists(java.nio.file.Paths.get(localFilePath));
+
+            return "Successfully generated and uploaded heap dump to: gs://" + heapBucketName + "/" + gcsObjectName;
+
+        } catch (Exception e) {
+            log.error("Failed to generate or upload heap dump: " + e.getMessage());
+
+            return "Error generating/uploading heap dump: " + e.getMessage();
+        }
+    }
+}
