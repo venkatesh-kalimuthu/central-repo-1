@@ -1,0 +1,237 @@
+package com.ford.decisionplatform.kbsservice.automation;
+
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.util.IOUtils;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
+
+@Service
+public class JsonataAutomationService {
+
+    private final ResourceLoader resourceLoader;
+    private final RestClient restClient;
+
+    @Value("${spring.fordllm.api.llm-url}")
+    private String fordAiUrl;
+
+    public JsonataAutomationService(ResourceLoader resourceLoader,
+                                    @Qualifier("fordllm-api") RestClient restClient) {
+        this.resourceLoader = resourceLoader;
+        IOUtils.setByteArrayMaxOverride(200_000_000);
+
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout((int) Duration.ofSeconds(30).toMillis());
+        factory.setReadTimeout((int) Duration.ofMinutes(10).toMillis());
+        this.restClient = restClient.mutate()
+                .requestFactory(factory)
+                .build();
+    }
+
+    public String updateJsonataFromExcel(InputStream excelInputStream, String existingColumn, String targetColumn, String schemaColumn, String schemaNames) throws Exception {
+
+        Set<String> detectedSchemas = new HashSet<>();
+        String excelData = parseExcel(excelInputStream, existingColumn, targetColumn, schemaColumn, schemaNames, detectedSchemas);
+
+        Resource resource = resourceLoader.getResource("classpath:jsonata/2.0/mapping-spec.jsonata");
+        String currentJsonata = Files.readString(Path.of(resource.getURI()));
+        List<String> targetSchemas;
+        if (schemaNames != null && !schemaNames.trim().isEmpty()) {
+            targetSchemas = Arrays.stream(schemaNames.split(","))
+                    .map(String::trim)
+                    .collect(Collectors.toList());
+        } else {
+            targetSchemas = new ArrayList<>(detectedSchemas);
+            schemaNames = String.join(", ", targetSchemas);
+            System.out.println("Auto-detected schemas from Excel: " + schemaNames);
+        }
+        List<String> jsonataChunks = splitJsonataIntoChunks(currentJsonata);
+        System.out.println("Semantically split JSONata into " + jsonataChunks.size() + " schema blocks.");
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(jsonataChunks.size(), 10));
+
+        final String finalSchemaNames = schemaNames; // For use in lambda
+
+        try {
+            List<CompletableFuture<String>> futures = jsonataChunks.stream()
+                    .map(chunk -> {
+
+                        boolean needsUpdate = targetSchemas.isEmpty() || targetSchemas.stream().anyMatch(chunk::contains);
+
+                        if (needsUpdate) {
+                            return CompletableFuture.supplyAsync(() ->
+                                    callFordLLMForChunk(excelData, chunk, existingColumn, targetColumn, finalSchemaNames), executor);
+                        } else {
+
+                            return CompletableFuture.completedFuture(chunk);
+                        }
+                    })
+                    .toList();
+            return futures.stream()
+                    .map(CompletableFuture::join)
+                    .collect(Collectors.joining(""));
+
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    private List<String> splitJsonataIntoChunks(String fullJsonata) {
+        String regex = "(?=\\r?\\n\\s*\"[a-zA-Z0-9-_]+-SCHEMA\"\\s*:)";
+        String[] rawChunks = fullJsonata.split(regex);
+        return Arrays.asList(rawChunks);
+    }
+
+    private String parseExcel(InputStream is, String existingColName, String targetColName, String schemaColName, String schemaNames, Set<String> detectedSchemas) throws Exception {
+        try (Workbook workbook = new XSSFWorkbook(is)) {
+            Sheet sheet = workbook.getSheetAt(0);
+            Row headerRow = sheet.getRow(0);
+
+            if (headerRow == null) {
+                throw new RuntimeException("Excel sheet is empty or has no header row.");
+            }
+
+            int existingColIdx = -1;
+            int targetColIdx = -1;
+            int schemaColIdx = -1;
+
+            for (Cell cell : headerRow) {
+                String cellValue = cell.getStringCellValue().trim();
+                if (cellValue.equalsIgnoreCase(existingColName)) {
+                    existingColIdx = cell.getColumnIndex();
+                } else if (cellValue.equalsIgnoreCase(targetColName)) {
+                    targetColIdx = cell.getColumnIndex();
+                } else if (cellValue.equalsIgnoreCase(schemaColName)) {
+                    schemaColIdx = cell.getColumnIndex();
+                }
+            }
+
+            if (existingColIdx == -1 || targetColIdx == -1) {
+                throw new RuntimeException("Could not find columns: " + existingColName + " or " + targetColName);
+            }
+            if (schemaColIdx == -1) {
+                throw new RuntimeException("Could not find schema column: " + schemaColName);
+            }
+            List<String> allowedSchemas = schemaNames == null || schemaNames.trim().isEmpty()
+                    ? List.of()
+                    : List.of(schemaNames.split(",")).stream().map(String::trim).toList();
+
+            StringBuilder sb = new StringBuilder();
+            DataFormatter formatter = new DataFormatter();
+
+            for (int i = 1; i <= sheet.getLastRowNum(); i++) {
+                Row row = sheet.getRow(i);
+                if (row == null) continue;
+
+                Cell cellSchema = row.getCell(schemaColIdx);
+                Cell cellSource = row.getCell(existingColIdx);
+                Cell cellTarget = row.getCell(targetColIdx);
+
+                if (cellSchema != null && cellSource != null && cellTarget != null) {
+                    String schemaVal = formatter.formatCellValue(cellSchema).trim();
+                    String sourceVal = formatter.formatCellValue(cellSource);
+                    String targetVal = formatter.formatCellValue(cellTarget);
+
+                    if (!schemaVal.isEmpty()) {
+                        detectedSchemas.add(schemaVal);
+                    }
+                    boolean shouldInclude = allowedSchemas.isEmpty() || allowedSchemas.contains(schemaVal);
+
+                    if (shouldInclude && !sourceVal.isEmpty() && !targetVal.isEmpty()) {
+                        sb.append(sourceVal).append(" -> ").append(targetVal)
+                                .append(" (Schema: ").append(schemaVal).append(")\n");
+                    }
+                }
+            }
+            return sb.toString();
+        }
+    }
+   private String callFordLLMForChunk(String excelMapping, String jsonataChunk, String existingCol, String targetCol, String schemaNames) {
+        System.out.println("Calling Ford LLM API for schema chunk...");
+        String prompt = String.format(
+                "Task: You are updating a SINGLE schema block within a larger JSONata file by applying field replacements based on an Excel mapping.\n\n" +
+                        "ALLOWED SCHEMAS FROM REQUEST (comma-separated): %s\n\n" +
+                        "Excel Mapping (Source Column: '%s' -> Target Column: '%s'):\n%s\n\n" +
+                        "JSONata Schema Block to Update:\n%s\n\n" +
+                        "CRITICAL INSTRUCTIONS:\n" +
+                        "1. **Apply Field Replacements to Values Only:** Systematically examine the *values* (the right-hand side of key-value pairs, including any JSONata path expressions like `$value.field_name`) within the 'JSONata Schema Block to Update'. If a part of a value (e.g., 'field_name' in `$value.field_name`) *exactly matches* an entry in the 'Source Column' of the 'Excel Mapping', replace ONLY that matching part with the corresponding 'Target Column' entry.\n" +
+                        "   (Example: If 'Source Column' is 'ac_acct_id_nb' and a JSONata value is `$value.ac_acct_id_nb`, and the 'Target Column' is 'new_acct_id_nb', then replace 'ac_acct_id_nb' with 'new_acct_id_nb' to result in `$value.new_acct_id_nb`.)\n" +
+                        "2. **No Key Changes, No Business Logic Changes:** DO NOT modify the field keys (left-hand side of a key-value pair, e.g., 'ACCT_ID_NB'). DO NOT alter any existing business logic, functions, or the overall JSONata syntax structure.\n" +
+                        "3. **Exact String Match Required:** Only perform replacements for *exact string matches* of the identified part of the value. Do NOT attempt to guess, infer, or replace similar-looking fields. (Example: If 'Source Column' is 'indicator', but the JSONata value contains 'CF-XFT-INDICATOR', this is NOT an exact match for the replaceable part. Do not change it.)\n" +
+                        "4. **Preserve Formatting:** Maintain ALL original formatting, indentation, brackets, and trailing commas exactly as they appear in the input 'JSONata Schema Block to Update'.\n" +
+                        "5. **Output Format - Raw JSONata:** Return ONLY the complete, modified JSONata schema block. The output must be raw JSONata source code, with NO markdown, NO backticks, NO explanations, and it must be syntactically valid JSONata.\n",
+                schemaNames, existingCol, targetCol, excelMapping, jsonataChunk
+        );
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", "claude-sonnet-4-5");
+        requestBody.put("messages", List.of(Map.of("role", "user", "content", prompt)));
+        requestBody.put("temperature", 0.0);
+
+        long startTime = System.currentTimeMillis();
+        System.out.println("Ford LLM API call STARTED for chunk...."+"StartTime: "+java.time.LocalDateTime.now());
+
+        try {
+            Map responseBody = restClient.post()
+                    .uri(fordAiUrl)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(requestBody)
+                    .retrieve()
+                    .onStatus(status -> !status.is2xxSuccessful(), (request, response) -> {
+                        System.err.println("LLM API error - Status: " + response.getStatusCode());
+                        throw new RuntimeException("Ford LLM API returned error: " + response.getStatusCode());
+                    })
+                    .body(Map.class);
+
+            long endTime = System.currentTimeMillis();
+            long durationMs = endTime - startTime;
+
+            System.out.println("Ford LLM API call End for chunk..."+"EndTime: "+java.time.LocalDateTime.now());
+            System.out.println("Chunk processed in " + durationMs + " ms");
+
+
+            if (responseBody == null || !responseBody.containsKey("choices")) {
+                throw new RuntimeException("Invalid response from Ford LLM - missing 'choices' field");
+            }
+
+            List<Map<String, Object>> choices = (List<Map<String, Object>>) responseBody.get("choices");
+            if (choices == null || choices.isEmpty()) {
+                throw new RuntimeException("Invalid response from Ford LLM - empty choices array");
+            }
+
+            Map<String, Object> message = (Map<String, Object>) choices.get(0).get("message");
+            if (message == null) {
+                throw new RuntimeException("Invalid response from Ford LLM - missing message");
+            }
+
+            String content = (String) message.get("content");
+            if (content == null || content.isEmpty()) {
+                throw new RuntimeException("Invalid response from Ford LLM - empty content");
+            }
+            return content.replaceAll("```jsonata\n|```json\n|```\n|```", "").trim() + "\n";
+
+        } catch (Exception e) {
+            long errorEndTime = System.currentTimeMillis();
+            long errorDurationMs = errorEndTime - startTime;
+
+            System.err.println("Ford LLM API call ERROR DURATION: " + errorDurationMs + " ms");
+            System.err.println("Error calling Ford LLM for chunk: " + e.getMessage());
+            return jsonataChunk;
+        }
+    }
+}
