@@ -1,0 +1,42 @@
+package com.ford.decisionplatform.kbsservice.encrypt;
+
+import com.google.crypto.tink.Aead;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.util.Base64;
+
+@Slf4j
+@Service
+public class EncryptionService {
+
+    private final Aead aead;
+
+    public EncryptionService(Aead aead) {
+        this.aead = aead;
+    }
+
+    public String encrypt(String plaintext) {
+        if (plaintext == null || plaintext.isEmpty()) return plaintext;
+        try {
+            byte[] ciphertext = aead.encrypt(plaintext.getBytes(), null);
+            return Base64.getEncoder().encodeToString(ciphertext);
+        } catch (Exception e) {
+            log.error("Encryption failed. This may indicate KMS permission issues or invalid key configuration.", e);
+            throw new RuntimeException("Encryption failed: " + e.getMessage() + 
+                    ". Verify KMS key access permissions and configuration.", e);
+        }
+    }
+
+    public String decrypt(String ciphertext) {
+        if (ciphertext == null || ciphertext.isEmpty()) return ciphertext;
+        try {
+            byte[] decoded = Base64.getDecoder().decode(ciphertext);
+            byte[] decrypted = aead.decrypt(decoded, null);
+            return new String(decrypted);
+        } catch (Exception e) {
+            log.error("Decryption failed. This may indicate KMS permission issues, invalid ciphertext, or key configuration issues.", e);
+            throw new RuntimeException("Decryption failed: " + e.getMessage() + 
+                    ". Verify KMS key access permissions and that the ciphertext was encrypted with the same key.", e);
+        }
+    }
+}
