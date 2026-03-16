@@ -1,0 +1,43 @@
+
+package com.ford.decisionplatform.kbsservice.encrypt;
+
+import com.google.crypto.tink.*;
+import com.google.crypto.tink.aead.AeadConfig;
+import com.google.crypto.tink.aead.AeadKeyTemplates;
+import com.google.crypto.tink.aead.KmsEnvelopeAead;
+import com.google.crypto.tink.integration.gcpkms.GcpKmsClient;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Slf4j
+@Configuration
+public class TinkKmsConfig {
+
+    @Value("${spring.security.kms.key-uri}")
+    private String kmsKeyUri;
+
+    @Bean
+    public Aead aead() throws Exception {
+        try {
+            log.info("Initializing Google Cloud KMS encryption with key URI: {}", kmsKeyUri);
+            AeadConfig.register();
+            
+            KmsClient client = new GcpKmsClient().withDefaultCredentials();
+            log.info("Successfully initialized GCP KMS client with default credentials");
+            
+            Aead gcpAead = client.getAead(kmsKeyUri);
+            log.info("Successfully retrieved KMS key from Google Cloud");
+            
+            return new KmsEnvelopeAead(AeadKeyTemplates.AES128_GCM, gcpAead);
+        } catch (Exception e) {
+            log.error("Failed to initialize encryption. This typically indicates missing IAM permissions. " +
+                    "Ensure the service account has 'roles/cloudkms.cryptoKeyEncrypterDecrypter' role on key: {}", 
+                    kmsKeyUri, e);
+            throw new IllegalStateException(
+                    "Failed to initialize KMS encryption. Check service account permissions for KMS key access. " +
+                    "Key URI: " + kmsKeyUri + ". Error: " + e.getMessage(), e);
+        }
+    }
+}
