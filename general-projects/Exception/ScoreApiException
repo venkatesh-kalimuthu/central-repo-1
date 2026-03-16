@@ -1,0 +1,40 @@
+package com.ford.decisionplatform.kbsservice.exception;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@Getter // Optional: Lombok can generate the getters for you
+public class ScoringAPIException extends RuntimeException {
+
+    private final int statusCode;        // Made final
+    private final String errorDescription; // Made final
+
+    public ScoringAPIException(String message) {
+        this(message, 200, null);
+    }
+
+    public ScoringAPIException(String message, int statusCode) {
+        this(message, statusCode, null);
+    }
+
+    // Master Constructor: Initializes all final fields
+    public ScoringAPIException(String message, int statusCode, String errorDescription) {
+        super(message);
+        this.statusCode = statusCode;
+        this.errorDescription = errorDescription;
+
+        // It is generally better to log where the exception is CAUGHT, not created.
+        // But keeping your original logic:
+        log.error("ScoringAPIException occurred: {}, Status Code: {}, Description: {}", message, statusCode, errorDescription);
+    }
+
+    // If you don't use @Getter, keep your manual getters below:
+    public int getStatusCode() {
+        return statusCode;
+    }
+
+    public String getErrorDescription() {
+        return errorDescription;
+    }
+}
