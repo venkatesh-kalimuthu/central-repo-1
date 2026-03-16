@@ -1,0 +1,28 @@
+package com.ford.decisionplatform.kbsservice.restclient;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+@Slf4j
+@Component
+public class ScoringAPIRestClient extends AbstractArtAPIRestClient {
+
+    @Value("${spring.scoring.api.c-url}")
+    private String scoringAPIUrl;
+
+    @Value("${spring.scoring.api.ci-url}")
+    private String scoringAPIUrlCI;
+
+    public ScoringAPIRestClient(
+            @Qualifier("scoring-api-commercial") RestClient restClient,
+            @Qualifier("scoring-api-commercial-individual") RestClient restClientCI) {
+        super(restClient, restClientCI);
+    }
+
+    public String callScoringAPI(String scoringAPIRequest, String applicantTypeCd) {
+        return routeByApplicantType(scoringAPIRequest, applicantTypeCd, scoringAPIUrlCI, scoringAPIUrl, "SCORING");
+    }
+}
