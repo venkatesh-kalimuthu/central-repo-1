@@ -1,0 +1,44 @@
+package com.ford.decisionplatform.kbsservice.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.SimpleAsyncTaskExecutor;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextHolder;
+
+import java.util.concurrent.Executor;
+
+@Slf4j
+@Configuration
+public class AsyncConfiguration implements AsyncConfigurer {
+
+    @Bean(name = "asyncExecutor")
+    public Executor asyncExecutor() {
+        SimpleAsyncTaskExecutor executor = new SimpleAsyncTaskExecutor("kbs-vt-");
+        executor.setVirtualThreads(true); // Enable Java 21 Virtual Threads
+        executor.setTaskTerminationTimeout(60_000);
+
+        executor.setTaskDecorator(runnable -> {
+            SecurityContext context = SecurityContextHolder.getContext();
+            return () -> {
+                try {
+                    SecurityContextHolder.setContext(context);
+                    runnable.run();
+                } finally {
+                    SecurityContextHolder.clearContext();
+                }
+            };
+        });
+
+        return executor;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (throwable, method, obj) ->
+                log.error("Async Error in method: {} - {}", method.getName(), throwable.getMessage());
+    }
+}
